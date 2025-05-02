@@ -32,6 +32,10 @@ struct Cli {
     #[arg(short, long, default_value_t = 80)]
     quality: u8,
 
+    /// Enable active screen capture (false will initialize but not capture frames)
+    #[arg(short, long, default_value_t = true)]
+    capture: bool,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -41,6 +45,7 @@ struct Cli {
 struct ClientSettings {
     fps: u8,
     quality: u8,
+    active_capture: bool,  // Whether to actively capture frames
 }
 
 #[tokio::main]
@@ -118,6 +123,7 @@ async fn main() -> Result<()> {
     let settings = Arc::new(Mutex::new(ClientSettings {
         fps: cli.fps,
         quality: cli.quality,
+        active_capture: cli.capture,
     }));
     
     // Spawn capture task
@@ -238,6 +244,12 @@ async fn handle_server_message(
                 settings.fps = fps;
             }
         }
+        ServerMessage::ToggleCapture { enabled } => {
+            info!("Server requested capture state change to {}", enabled);
+            if let Ok(mut settings) = settings.lock() {
+                settings.active_capture = enabled;
+            }
+        }
         ServerMessage::Goodbye => {
             info!("Server is closing connection");
             let _ = control_tx.send(ControlMessage::Shutdown).await;
@@ -268,22 +280,38 @@ async fn capture_frames(
     
     let screen = &screens[0]; // Use the first screen
     info!(
-        "Capturing primary screen: {}x{} at ({}, {})",
+        "Initializing primary screen: {}x{} at ({}, {})",
         screen.display_info.width,
         screen.display_info.height,
         screen.display_info.x,
         screen.display_info.y
     );
     
+    // Take a single screenshot to get initial dimensions and format
+    let initial_capture = match screen.capture() {
+        Ok(capture) => capture,
+        Err(e) => {
+            error!("Failed to capture initial screen: {}", e);
+            return;
+        }
+    };
+    
+    let width = initial_capture.width() as u32;
+    let height = initial_capture.height() as u32;
+    info!("Screen initialized successfully: {}x{}", width, height);
+    
+    // Create an empty buffer to send when capture is disabled
+    let empty_buffer = vec![0; (width * height * 4) as usize]; // 4 bytes per pixel (BGRA)
+    
     let mut last_frame_time = Instant::now();
     
     loop {
-        // Check our current FPS setting
-        let fps = {
+        // Check our current settings
+        let (fps, active_capture) = {
             if let Ok(settings) = settings.lock() {
-                settings.fps
+                (settings.fps, settings.active_capture)
             } else {
-                30 // Default if we can't access settings
+                (30, false) // Default if we can't access settings
             }
         };
         
@@ -296,39 +324,52 @@ async fn capture_frames(
             time::sleep(frame_delay - elapsed).await;
         }
         
-        // Capture screen
-        let capture = match screen.capture() {
-            Ok(capture) => capture,
-            Err(e) => {
-                error!("Failed to capture screen: {}", e);
-                // Wait a bit before trying again
-                time::sleep(Duration::from_millis(100)).await;
-                continue;
+        let frame = if active_capture {
+            // Only capture the screen if active capture is enabled
+            debug!("Capturing frame");
+            match screen.capture() {
+                Ok(capture) => {
+                    // Convert image to our format
+                    let width = capture.width() as u32;
+                    let height = capture.height() as u32;
+                    let buffer = capture.as_raw().to_vec();
+                    
+                    FrameData {
+                        width,
+                        height,
+                        timestamp: util::current_timestamp(),
+                        data: buffer,
+                        format: cleverest::common::protocol::PixelFormat::BGRA,
+                        compressed: false, // Not implementing compression yet
+                        key_frame: true,   // All frames are key frames for now
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to capture screen: {}", e);
+                    // Send empty frame with timestamp when capture fails
+                    FrameData {
+                        width,
+                        height,
+                        timestamp: util::current_timestamp(),
+                        data: empty_buffer.clone(),
+                        format: cleverest::common::protocol::PixelFormat::BGRA,
+                        compressed: false,
+                        key_frame: true,
+                    }
+                }
             }
-        };
-        
-        // Get quality setting (for future use in compression)
-        let _quality = {
-            if let Ok(settings) = settings.lock() {
-                settings.quality
-            } else {
-                80 // Default if we can't access settings
+        } else {
+            // Send empty or blank frame when capture is disabled
+            debug!("Capture disabled, sending placeholder frame");
+            FrameData {
+                width,
+                height,
+                timestamp: util::current_timestamp(),
+                data: empty_buffer.clone(),
+                format: cleverest::common::protocol::PixelFormat::BGRA,
+                compressed: false,
+                key_frame: true,
             }
-        };
-        
-        // Convert image to our format
-        let width = capture.width() as u32;
-        let height = capture.height() as u32;
-        // The screenshots crate returns an image with raw BGRA data
-        let buffer = capture.as_raw().to_vec();
-        
-        // Create FrameData
-        let frame = FrameData {
-            width,
-            height,
-            timestamp: util::current_timestamp(),
-            data: buffer.to_vec(),
-            format: cleverest::common::protocol::PixelFormat::BGRA, // screenshots crate uses BGRA
         };
         
         // Send the frame

@@ -101,6 +101,9 @@ async fn main() -> Result<()> {
     // Create channels for communication
     let (control_tx, control_rx) = mpsc::channel(100);
     
+    // Main toggle channel that will broadcast messages to all clients
+    let (toggle_tx, _) = mpsc::channel(10);
+    
     // Shared server state
     let state = Arc::new(Mutex::new(ServerState {
         current_frame: None,
@@ -113,8 +116,9 @@ async fn main() -> Result<()> {
     
     // Start the display task
     let display_state = state.clone();
+    let display_toggle_tx = toggle_tx.clone(); 
     let display_handle = tokio::task::spawn_blocking(move || {
-        run_display(control_rx, display_state)
+        run_display(control_rx, display_state, display_toggle_tx)
     });
     
     // Accept connections
@@ -130,11 +134,14 @@ async fn main() -> Result<()> {
                     state.connected_clients += 1;
                 }
                 
+                // Create a new toggle channel for this connection
+                let (_conn_toggle_tx, conn_toggle_rx) = mpsc::channel::<ServerMessage>(10);
+                
                 // Handle this connection in a new task
                 let conn_control_tx = control_tx.clone();
                 let conn_state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(connection, conn_control_tx, conn_state.clone()).await {
+                    if let Err(e) = handle_connection(connection, conn_control_tx, conn_toggle_rx, conn_state.clone()).await {
                         error!("Connection error: {}", e);
                     }
                     
@@ -149,6 +156,11 @@ async fn main() -> Result<()> {
         }
     }
     
+    // Send shutdown message to display task
+    if let Err(e) = control_tx.send(ControlMessage::Shutdown).await {
+        error!("Failed to send shutdown message: {}", e);
+    }
+    
     // Wait for display task to finish
     let _ = display_handle.await;
     
@@ -159,6 +171,7 @@ async fn main() -> Result<()> {
 async fn handle_connection(
     connection: quinn::Connection,
     control_tx: mpsc::Sender<ControlMessage>,
+    mut toggle_rx: mpsc::Receiver<ServerMessage>,
     state: Arc<Mutex<ServerState>>,
 ) -> Result<()> {
     // Accept a bi-directional stream
@@ -197,6 +210,21 @@ async fn handle_connection(
     
     // Process incoming messages
     loop {
+        // Check if we have any toggle messages to send
+        if let Ok(toggle_msg) = toggle_rx.try_recv() {
+            match toggle_msg {
+                ServerMessage::ToggleCapture { enabled } => {
+                    info!("Sending capture toggle ({}) to client", enabled);
+                    if let Ok(encoded) = bincode::serialize(&toggle_msg) {
+                        if let Err(e) = send.write_all(&encoded).await {
+                            error!("Failed to send toggle message: {}", e);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        
         let mut buffer = vec![0; 10 * 1024 * 1024]; // 10MB buffer for large frames
         
         match recv.read(&mut buffer).await {
@@ -205,11 +233,14 @@ async fn handle_connection(
                 break;
             }
             Ok(Some(n)) => {
+                debug!("Received {} bytes from client", n);
                 match bincode::deserialize::<ClientMessage>(&buffer[..n]) {
                     Ok(msg) => {
                         match msg {
                             ClientMessage::Frame(frame) => {
                                 // Process the frame
+                                debug!("Received frame: {}x{}, format: {:?}, data size: {} bytes",
+                                    frame.width, frame.height, frame.format, frame.data.len());
                                 process_frame(frame, &mut send, &control_tx, &state).await?;
                             }
                             ClientMessage::Goodbye => {
@@ -223,6 +254,13 @@ async fn handle_connection(
                     }
                     Err(e) => {
                         error!("Failed to deserialize client message: {}", e);
+                        
+                        // Log more details to help diagnose the issue
+                        if n > 100 {
+                            error!("Message starts with: {:?}", &buffer[..100]);
+                        } else {
+                            error!("Message: {:?}", &buffer[..n]);
+                        }
                         continue;
                     }
                 }
@@ -290,6 +328,7 @@ async fn process_frame(
 fn run_display(
     mut control_rx: mpsc::Receiver<ControlMessage>,
     state: Arc<Mutex<ServerState>>,
+    toggle_tx: mpsc::Sender<ServerMessage>,
 ) -> Result<()> {
     // Create a window
     let mut window = Window::new(
@@ -303,14 +342,28 @@ fn run_display(
         },
     )?;
     
+    info!("Press T to toggle client screen capture");
+    
     // Start with a blank screen
     let mut buffer = vec![0; 800 * 600];
     
     // Set a reasonable FPS limit for the display
     window.limit_update_rate(Some(Duration::from_micros(16600))); // ~60 FPS
     
+    // For tracking key states
+    let mut capture_enabled = true;
+    
     // Main display loop
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Check for key presses
+        if window.is_key_pressed(Key::T, minifb::KeyRepeat::No) {
+            capture_enabled = !capture_enabled;
+            info!("Toggling capture to {}", capture_enabled);
+            // Send toggle message through the channel
+            let toggle_msg = ServerMessage::ToggleCapture { enabled: capture_enabled };
+            let _ = toggle_tx.try_send(toggle_msg);
+        }
+        
         // Check for new frames
         while let Ok(msg) = control_rx.try_recv() {
             match msg {
@@ -339,15 +392,21 @@ fn run_display(
                     match frame.format {
                         cleverest::common::protocol::PixelFormat::BGRA => {
                             // Convert BGRA to ARGB (what minifb expects)
-                            for (i, pixel) in buffer.iter_mut().enumerate() {
-                                let idx = i * 4;
+                            // The buffer for minifb is an array of u32 values, one per pixel
+                            // but frame.data is a flat array of bytes (4 bytes per pixel in BGRA format)
+                            let pixels = frame.width as usize * frame.height as usize;
+                            buffer.resize(pixels, 0); // Ensure buffer is correctly sized
+                            
+                            for i in 0..pixels {
+                                let idx = i * 4; // Each pixel is 4 bytes in frame.data
                                 if idx + 3 < frame.data.len() {
                                     let b = frame.data[idx] as u32;
                                     let g = frame.data[idx + 1] as u32;
                                     let r = frame.data[idx + 2] as u32;
                                     let a = frame.data[idx + 3] as u32;
                                     
-                                    *pixel = (a << 24) | (r << 16) | (g << 8) | b;
+                                    // minifb expects ARGB format
+                                    buffer[i] = (a << 24) | (r << 16) | (g << 8) | b;
                                 }
                             }
                         }

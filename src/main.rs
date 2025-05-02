@@ -36,6 +36,10 @@ enum Commands {
         /// Quality (1-100)
         #[arg(short, long, default_value_t = 80)]
         quality: u8,
+        
+        /// Enable active screen capture (false will initialize but not capture frames)
+        #[arg(short, long, default_value_t = true)]
+        capture: bool,
     },
     /// Run as server (display)
     Server {
@@ -72,11 +76,12 @@ fn main() -> Result<()> {
             port,
             fps,
             quality,
+            capture,
         } => {
             info!("Starting client, connecting to {}:{}", server, port);
             // In a real implementation, this would call the client module's run function
             // but for demo purposes we just show the command line usage
-            info!("Using FPS: {}, Quality: {}", fps, quality);
+            info!("Using FPS: {}, Quality: {}, Capture: {}", fps, quality, capture);
             info!("To run the actual client binary, use: cargo run --bin client --features client");
             Ok(())
         }

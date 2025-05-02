@@ -7,6 +7,8 @@ pub struct FrameData {
     pub timestamp: u64,
     pub data: Vec<u8>,
     pub format: PixelFormat,
+    pub compressed: bool,   // Whether the data is compressed
+    pub key_frame: bool,    // Whether this is a key frame (full image) or delta
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -43,6 +45,9 @@ pub enum ServerMessage {
     },
     ConfigureFrameRate {
         fps: u8,
+    },
+    ToggleCapture {
+        enabled: bool,
     },
     Goodbye,
 }
